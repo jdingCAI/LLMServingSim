@@ -150,6 +150,25 @@ def main():
 
     if enable_prefix_caching and enable_prefix_sharing and prefix_storage != 'None':
         num_prefix_pool = num_nodes
+        # Compute per-token KV cache size from model config (bytes per token across all GPUs)
+        # This replaces the old hardcoded 131072 which was only correct for Llama-3.1-8B TP1.
+        _inst0 = instances[0]
+        _model_cfg = get_config(_inst0["model_name"])
+        _n_embd = _model_cfg['hidden_size']
+        _n_head = _model_cfg['num_attention_heads']
+        _n_kv_head = _model_cfg.get('num_key_value_heads', _n_head)
+        _n_layer = _model_cfg['num_hidden_layers']
+        _kv_dim = _n_embd // (_n_head // _n_kv_head)  # kv_head * head_dim
+        _npu_num = _inst0["npu_num"]
+        _npus_per_group = _npu_num // _inst0["npu_group"]
+        # get_kv(1) per GPU = 2 * kv_dim * n_layer * fp // npu_num_per_group ... but for the
+        # shared pool we need total across all GPUs = 2 * kv_dim * n_layer * fp (fp in bytes)
+        _fp_bytes = fp // 8
+        _kv_bytes_per_token = 2 * _kv_dim * _n_layer * _fp_bytes  # total KV bytes per token (all GPUs combined cancel out with TP)
+        logger.info(f"Shared prefix pool kv_size per token: {_kv_bytes_per_token} bytes "
+                    f"(model={_inst0['model_name']}, layers={_n_layer}, kv_heads={_n_kv_head}, "
+                    f"head_dim={_n_embd // _n_head}, fp={fp}bit, npu_num={_npu_num})")
+
         # make prefix pool objects based on num_prefix_pool
         prefix_pools = []
         if prefix_storage == 'CPU':
@@ -157,10 +176,10 @@ def main():
                 if cpu_mem_size[i] > 0:
                     new_prefix_pool = RadixCache(
                                                 node_id=0,
-                                                device=prefix_storage, 
+                                                device=prefix_storage,
                                                 page_size=256,
                                                 capacity = cpu_mem_size[i] * GB_TO_BYTE,
-                                                kv_size=131072,
+                                                kv_size=_kv_bytes_per_token,
                                                 enable_kv_cache_events=True)
                     prefix_pools.append(new_prefix_pool)
                 else:
@@ -172,10 +191,10 @@ def main():
             if cluster["cxl_mem_size"] > 0:
                 new_prefix_pool = RadixCache(
                                             node_id=None,
-                                            device=prefix_storage, 
+                                            device=prefix_storage,
                                             page_size=1,
-                                            capacity = cluster["cxl_mem_size"] * GB_TO_BYTE, 
-                                            kv_size=131072,
+                                            capacity = cluster["cxl_mem_size"] * GB_TO_BYTE,
+                                            kv_size=_kv_bytes_per_token,
                                             enable_kv_cache_events=True)
                 prefix_pools.append(new_prefix_pool)
                 # This means every instance shares the same universal prefix pool (maybe fixed later)
@@ -365,7 +384,7 @@ def main():
                 for i, (node_id, inst_ids) in enumerate(node2inst_mapping.items()):
                     node_cpu_usage = 0
                     if enable_prefix_sharing and prefix_storage == "CPU":
-                        node_cpu_usage = (prefix_pools[node_id].total_size() * 131072)
+                        node_cpu_usage = (prefix_pools[node_id].total_size() * prefix_pools[node_id].kv_size)
                     else:
                         inst_usage = []
                         for inst_id in inst_ids:
@@ -398,16 +417,16 @@ def main():
             if prefix_storage == "CXL":
                 if enable_prefix_sharing:
                     num_prefix_pool = len(prefix_pools)
-                    for i, cxl_id, cxl_pool in enumerate(prefix_pools):
-                        cxl_usage = (cxl_pool.total_size() * 131072)
+                    for i, cxl_pool in enumerate(prefix_pools):
+                        cxl_usage = (cxl_pool.total_size() * cxl_pool.kv_size)
                         cxl_util = cxl_usage / cxl_pool.capacity
                         if not power_modeling and i == num_prefix_pool - 1:
                             tree_indent = '└─'
-                        print(f"{log_indent+tree_indent}CXL[{cxl_id}]: Total CXL Device Memory Usage {cxl_usage/MB_TO_BYTE:.2f}MB, {cxl_util:.3f} % Used")
+                        print(f"{log_indent+tree_indent}CXL[{i}]: Total CXL Device Memory Usage {cxl_usage/MB_TO_BYTE:.2f}MB, {cxl_util:.3f} % Used")
                 else:
                     # else only one instance could explictly use CXL
                     inst_id = 0
-                    cxl_usage = (schedulers[inst_id].memory.second_tier_prefix_cache.total_size() * 131072)
+                    cxl_usage = (schedulers[inst_id].memory.second_tier_prefix_cache.total_size() * schedulers[inst_id].memory.second_tier_prefix_cache.kv_size)
                     cxl_util = cxl_usage / schedulers[inst_id].memory.second_tier_prefix_cache.capacity
                     if not power_modeling:
                         tree_indent = '└─'

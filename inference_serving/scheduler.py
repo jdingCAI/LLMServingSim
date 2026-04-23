@@ -272,6 +272,10 @@ class Scheduler:
                     self.memory.prefix_match(req)
                     # self.memory.npu_lock_prefix(req)
                     self.memory.lock_prefix(req, Device.NPU)
+                    # Force all prefix hits to be treated as CPU-only (models LMCache behavior:
+                    # KV cache stored on CPU DRAM, must be loaded over PCIe on hit)
+                    if self.prefix_storage is not None:
+                        req.prefix_cache_hit = 0
             
             kv_size = 0
             evict_size = 0
@@ -421,11 +425,14 @@ class Scheduler:
                 if req.is_init:
                     total_len += req.input
                     req.set_que_delay(current)
-                    if self.enable_prefix_caching and req.prefix_cache_hit > 0:
-                        hit_len += req.prefix_cache_hit
-                    q_list.append(max(req.input - req.prefix_cache_hit, 1))
+                    # Use storage_cache_hit for compute savings when prefix_storage is set
+                    # (models LMCache: KV on CPU, skip recomputation but pay transfer cost)
+                    effective_hit = req.storage_cache_hit if self.prefix_storage is not None else req.prefix_cache_hit
+                    if self.enable_prefix_caching and effective_hit > 0:
+                        hit_len += effective_hit
+                    q_list.append(max(req.input - effective_hit, 1))
                     num_prefill += 1
-                    prefill_q_list.append(max(req.input - req.prefix_cache_hit, 1))
+                    prefill_q_list.append(max(req.input - effective_hit, 1))
                     prefill_k_list.append(0)
                 else:
                     total_len += 1    

@@ -2048,11 +2048,17 @@ def _load_attn_perf_db_dict(hardware, model, tp):
     
     prefill_file_path = f"../llm_profile/perf_models/{hardware}/{model}/tp{tp}/predictions/attn_prefill_predictions.csv"
     if not os.path.isfile(prefill_file_path):
-        raise FileNotFoundError(f"Perf CSV not found: {prefill_file_path}")
+        if os.path.isfile(prefill_file_path + ".gz"):
+            prefill_file_path += ".gz"
+        else:
+            raise FileNotFoundError(f"Perf CSV not found: {prefill_file_path} (or .gz)")
 
     decode_file_path = f"../llm_profile/perf_models/{hardware}/{model}/tp{tp}/predictions/attn_decode_predictions.csv"
     if not os.path.isfile(decode_file_path):
-        raise FileNotFoundError(f"Perf CSV not found: {decode_file_path}")
+        if os.path.isfile(decode_file_path + ".gz"):
+            decode_file_path += ".gz"
+        else:
+            raise FileNotFoundError(f"Perf CSV not found: {decode_file_path} (or .gz)")
 
     prefill_df = pd.read_csv(prefill_file_path, sep=",")
     decode_df = pd.read_csv(decode_file_path, sep=",")
@@ -2159,15 +2165,54 @@ def _get_perf_row(perf_db, hardware, layer_name, input_len, kv_cache_len, tp_siz
                 return best_row
             else:
                 return {"layer_name": layer_name, "input": input_len, "kv_cache": kv_cache_len, "tp_size": tp_size, "latency(ns)": 1}
-        else: 
-            raise KeyError(
-                f"No perf entry for key={key} in performance DB."
-            )
+        else:
+            # Nearest-neighbor fallback for GPU hardware
+            target_layer = str(layer_name)
+            target_tp = int(tp_size)
+            target_kv = int(kv_cache_len)
+            target_input = int(input_len)
+
+            best_row = None
+            best_diff = None
+            best_kv_match = False
+
+            for (layer, inp, kv, tp), row in perf_db.items():
+                if layer != target_layer or tp != target_tp:
+                    continue
+
+                kv_match = kv == target_kv
+                diff = abs(inp - target_input)
+
+                if (
+                    best_row is None
+                    or (kv_match and not best_kv_match)
+                    or (kv_match == best_kv_match and diff < best_diff)
+                ):
+                    best_row = row
+                    best_diff = diff
+                    best_kv_match = kv_match
+
+            if best_row is not None:
+                return best_row
+            else:
+                raise KeyError(
+                    f"No perf entry for key={key} in performance DB."
+                )
     
 def _get_attn_perf_row(perf_db, key):
     try:
         return perf_db[key]
     except KeyError:
+        # Nearest-neighbor fallback: find closest key by L1 distance
+        best_key = None
+        best_dist = float('inf')
+        for db_key in perf_db:
+            dist = sum(abs(a - b) for a, b in zip(key, db_key))
+            if dist < best_dist:
+                best_dist = dist
+                best_key = db_key
+        if best_key is not None:
+            return perf_db[best_key]
         raise KeyError(
             f"No perf entry for key={key} in attention performance DB."
         )
@@ -2314,6 +2359,8 @@ def _build_attn_feature_row(
     elif hardware == "RTX3090":
         num_sm = 82
     elif hardware == "H100":
+        num_sm = 132
+    elif hardware == "H200":
         num_sm = 132
     else:
         raise RuntimeError(f"{hardware} is not supported yet")

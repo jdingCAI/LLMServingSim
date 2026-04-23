@@ -510,10 +510,27 @@ class MemoryModel():
                         self.logger.warning("NPU prefix cache remove unknown block hash {h}")
                     npu_byte_free += self.get_kv(tlen)
         
-        if npu_byte_alloc > 0:
-            self.allocate(npu_byte_alloc, Device.NPU)
+        # Apply frees first, then allocs
         if npu_byte_free > 0:
             self.free(npu_byte_free, Device.NPU)
+        if npu_byte_alloc > 0:
+            # Evict prefix cache from GPU if needed to make room
+            avail = self.npu_mem - self.npu_used
+            if npu_byte_alloc > avail:
+                need = npu_byte_alloc - avail
+                evictable = self.npu_prefix_cache.evictable_size() * self._bytes_per_token
+                if evictable > 0:
+                    evict_amount = min(need, evictable)
+                    space_needed = int(evict_amount / self._bytes_per_token)
+                    self.npu_prefix_cache.evict(space_needed)
+                    # Re-apply any new frees from eviction
+                    for ev in self.npu_prefix_cache.take_events():
+                        if isinstance(ev, BlockRemoved):
+                            for h in ev.block_hashes:
+                                tlen = self._npu_cache_hashtolen.pop(h, 0)
+                                extra_free = self.get_kv(tlen)
+                                self.free(extra_free, Device.NPU)
+            self.allocate(npu_byte_alloc, Device.NPU)
 
         if not self.enable_prefix_sharing and self.prefix_storage is Device.CPU:
             for ev in self.second_tier_prefix_cache.take_events():
